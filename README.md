@@ -29,10 +29,22 @@
 
 ## 用法
 
-**最简单**：关掉 Claude，双击 `claude-hanhua.exe`，等它跑完，再打开 Claude。
+**双击打开，窗口里点按钮就行。** 不用记命令行，也不会闪一下就没。
+
+窗口里有四个按钮：
+
+| 按钮 | 作用 |
+|---|---|
+| 一键汉化 | 已汉化就跳过，Claude 升级过就自动重打 |
+| 强制重打 | 无视「已是中文」的判断，把词库重新注入一遍 |
+| 还原原版 | 从备份恢复成原版日文界面 |
+| 刷新状态 | 重新检测当前状态 |
+
+窗口顶部状态行一句话说清现状（已中文 / 需要汉化）。下面日志框写每个安装目录的细节：语言表多少条、中文占多少、上次汉化是什么时候。跑完弹提示框，点掉就能去开 Claude 了。
+
+命令行参数仍然保留，加上任一参数就不弹窗口（自动化、脚本里用）：
 
 ```
-claude-hanhua.exe              自动检测：已是中文就跳过，升级过就重打
 claude-hanhua.exe -status      只看状态诊断（是否汉化过、是否升级了）
 claude-hanhua.exe -list        列出检测到的 Claude 安装
 claude-hanhua.exe -dry         只检查不写入（看命中率）
@@ -113,11 +125,19 @@ claude-hanhua.exe -restore
 
 ## 自己编译
 
-需要 Go 1.21+：
+需要 Go 1.21+。界面用的是 [lxn/walk](https://github.com/lxn/walk)（Windows 原生控件，纯 Go，不需要 CGO）。
 
 ```powershell
+# 1. 拉依赖
+go get github.com/lxn/walk
+go install github.com/akavel/rsrc@latest
+
+# 2. 生成 Windows 资源（清单文件，GUI 控件必须要有，否则样式退回老古董）
+rsrc -manifest app.manifest -o rsrc.syso -arch amd64
+
+# 3. 编译。-H=windowsgui 让程序不带控制台窗口
 $env:CGO_ENABLED='0'
-go build -ldflags="-s -w" -trimpath -o claude-hanhua.exe .
+go build -ldflags="-s -w -H=windowsgui" -trimpath -o claude-hanhua.exe .
 ```
 
 词库 `zh.json.gz` 通过 `go:embed` 编进 exe，所以产物是单文件、无运行时依赖的。

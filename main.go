@@ -28,8 +28,20 @@ var zhGz []byte
 const (
 	targetEntry = "i18n/ja-JP.json"
 	toolName    = "Claude 桌面版一键汉化"
-	toolVer     = "1.1.0"
+	toolVer     = "1.2.0"
 )
+
+// logEmit 由界面层接管，用于把日志实时推到窗口里；为空时直接打印到控制台
+var logEmit func(string)
+
+func logf(format string, a ...any) {
+	s := fmt.Sprintf(format, a...)
+	if logEmit != nil {
+		logEmit(s)
+		return
+	}
+	fmt.Print(s)
+}
 
 func init() {
 	k := syscall.NewLazyDLL("kernel32.dll")
@@ -82,110 +94,145 @@ type Analysis struct {
 	Ratio   float64
 	Info    *AsarInfo
 	State   *State
-	Verdict string // already / partial / stale / never / newer
+	Verdict string // already / partial / stale / upgrade / never
+}
+
+// Options 一次操作的全部参数
+type Options struct {
+	Dir      string
+	Restore  bool
+	Dry      bool
+	Force    bool
+	NoBackup bool
+	Status   bool
+	Quiet    bool
 }
 
 func main() {
 	var (
-		dir      = flag.String("dir", "", "Claude 安装目录（默认自动检测）")
+		dir      = flag.String("dir", "", "指定 Claude 安装目录")
 		restore  = flag.Bool("restore", false, "从备份还原成原版")
 		dry      = flag.Bool("dry", false, "只检查不写入")
 		list     = flag.Bool("list", false, "列出检测到的 Claude 安装")
-		status   = flag.Bool("status", false, "只看汉化状态与升级判断")
-		force    = flag.Bool("force", false, "强制重新汉化（忽略「已是中文」判断）")
-		noBackup = flag.Bool("no-backup", false, "不创建备份（不建议）")
+		status   = flag.Bool("status", false, "只看状态诊断")
+		force    = flag.Bool("force", false, "强制重新汉化")
+		noBackup = flag.Bool("no-backup", false, "不创建备份")
+		cli      = flag.Bool("cli", false, "强制使用命令行模式")
 	)
 	flag.Usage = func() {
 		fmt.Printf("%s v%s\n\n", toolName, toolVer)
-		fmt.Println("用法: claude-hanhua.exe [参数]")
-		fmt.Println()
-		fmt.Println("  （无参数）        自动检测：已是中文就跳过，升级过就重打")
-		fmt.Println("  -status          只看状态诊断，不改任何文件")
-		fmt.Println("  -dir <路径>      指定 Claude 安装目录")
-		fmt.Println("  -restore         还原成原版（从备份）")
-		fmt.Println("  -dry             只检查，不写文件")
-		fmt.Println("  -force           强制重新汉化")
-		fmt.Println("  -list            列出检测到的安装")
-		fmt.Println("  -no-backup       不备份（不建议）")
-		fmt.Println()
+		fmt.Println("双击直接打开图形界面。命令行参数：")
+		fmt.Println("  -dir <路径>   指定安装目录")
+		fmt.Println("  -restore      还原成原版")
+		fmt.Println("  -status       只看状态诊断")
+		fmt.Println("  -dry          只检查不写入")
+		fmt.Println("  -force        强制重新汉化")
+		fmt.Println("  -list         列出安装")
+		fmt.Println("  -no-backup    不备份")
+		fmt.Println("  -cli          命令行模式（不弹窗）")
 	}
 	flag.Parse()
 
-	fmt.Printf("== %s v%s ==\n\n", toolName, toolVer)
-
-	dirs := []string{}
-	if *dir != "" {
-		dirs = []string{*dir}
-	} else {
-		dirs = detectDirs()
-	}
-	if len(dirs) == 0 {
-		fatal("没有找到 Claude 桌面版安装目录。\n" +
-			"默认位置: %LOCALAPPDATA%\\AnthropicClaude\\app-<版本>\\\n" +
-			"如果装在别处，用 -dir 指定。")
+	// 没有任何参数、也没显式要求命令行 -> 开图形界面
+	if flag.NFlag() == 0 && !*cli {
+		runGUI()
+		return
 	}
 
-	st := loadState()
-	warnNewerVersion(dirs, st)
-
+	allocConsole()
+	opt := Options{
+		Dir: *dir, Restore: *restore, Dry: *dry,
+		Force: *force, NoBackup: *noBackup, Status: *status,
+	}
 	if *list {
+		dirs := dirsOf(opt)
 		fmt.Println("检测到的安装：")
 		for i, d := range dirs {
 			fmt.Printf("  [%d] %s\n", i+1, d)
 		}
 		return
 	}
+	if err := runOnce(opt); err != nil {
+		fmt.Printf("\n[错误] %v\n", err)
+		os.Exit(1)
+	}
+}
 
-	if *restore {
+func allocConsole() {
+	k := syscall.NewLazyDLL("kernel32.dll")
+	r, _, _ := k.NewProc("AttachConsole").Call(^uintptr(0))
+	if r == 0 {
+		k.NewProc("AllocConsole").Call()
+	}
+}
+
+func dirsOf(opt Options) []string {
+	if opt.Dir != "" {
+		return []string{opt.Dir}
+	}
+	return detectDirs()
+}
+
+// runOnce 执行一次完整流程，所有输出都走 logf
+func runOnce(opt Options) error {
+	logf("== %s v%s ==\n\n", toolName, toolVer)
+
+	dirs := dirsOf(opt)
+	if len(dirs) == 0 {
+		return errors.New("没有找到 Claude 桌面版安装目录。\n默认位置: %LOCALAPPDATA%\\AnthropicClaude\\app-<版本>\\")
+	}
+
+	st := loadState()
+	warnNewerVersion(dirs, st)
+
+	if opt.Restore {
 		for _, d := range dirs {
 			if err := doRestore(d); err != nil {
-				fmt.Printf("[失败] %s: %v\n", d, err)
+				logf("[失败] %s: %v\n", d, err)
 			}
 		}
-		return
+		return nil
 	}
 
 	analyses := make([]*Analysis, 0, len(dirs))
 	for _, d := range dirs {
 		a, err := analyze(d, st)
 		if err != nil {
-			fmt.Printf("目标: %s\n  [跳过] %v\n\n", d, err)
+			logf("目标: %s\n  [跳过] %v\n\n", d, err)
 			continue
 		}
 		analyses = append(analyses, a)
 	}
+	if len(analyses) == 0 {
+		return errors.New("所有安装都无法解析，请确认 Claude 版本")
+	}
 
-	if *status {
+	if opt.Status {
 		for _, a := range analyses {
 			printAnalysis(a)
 		}
 		printStateInfo(st)
-		return
+		return nil
 	}
 
 	didWork := false
 	for _, a := range analyses {
 		printAnalysis(a)
-		if a.Verdict == "already" && !*force && !*dry {
-			fmt.Println("  -> 已是中文，跳过（要重打请加 -force）")
-			fmt.Println()
+		if a.Verdict == "already" && !opt.Force && !opt.Dry {
+			logf("  -> 已是中文，跳过（要重打请勾选「强制」）\n\n")
 			continue
 		}
-		if err := doPatch(a, *dry, *noBackup); err != nil {
-			fmt.Printf("  [失败] %v\n\n", err)
+		if err := doPatch(a, opt.Dry, opt.NoBackup); err != nil {
+			logf("  [失败] %v\n\n", err)
 			continue
 		}
 		didWork = true
-		fmt.Println()
+		logf("\n")
 	}
-	if !didWork && !*dry {
-		fmt.Println("没有需要处理的安装。")
+	if !didWork && !opt.Dry {
+		logf("没有需要处理的安装。\n")
 	}
-}
-
-func fatal(msg string) {
-	fmt.Printf("[错误] %s\n", msg)
-	os.Exit(1)
+	return nil
 }
 
 func detectDirs() []string {
@@ -277,9 +324,8 @@ func warnNewerVersion(dirs []string, st *State) {
 		}
 	}
 	if newer != "" {
-		fmt.Printf("[注意] 检测到更新版本 app-%s，上次汉化针对的是 app-%s。\n", newer, st.Version)
-		fmt.Println("       旧版本资源不通用，需要对这个新版本重新汉化。")
-		fmt.Println()
+		logf("[注意] 检测到更新版本 app-%s，上次汉化针对的是 app-%s。\n", newer, st.Version)
+		logf("       旧版本资源不通用，需要对这个新版本重新汉化。\n\n")
 	}
 }
 
@@ -321,7 +367,7 @@ func findEntry(e *Entry, prefix, target string) *Entry {
 func openAsar(ap string) (*AsarInfo, error) {
 	buf, err := os.ReadFile(ap)
 	if err != nil {
-		return nil, fmt.Errorf("读取 asar 失败（Claude 可能正在运行，先退出）: %w", err)
+		return nil, fmt.Errorf("读取 asar 失败（Claude 可能还在运行，先退出）: %w", err)
 	}
 	if len(buf) < 16 {
 		return nil, errors.New("asar 文件损坏")
@@ -418,10 +464,8 @@ func analyze(d string, st *State) (*Analysis, error) {
 		// 日文原版里也有约 5% 条目不含假名（纯汉字短词），所以门槛不能设太低
 		a.Verdict = "partial"
 	case st != nil && st.Version == a.Version && st.HeaderHash != info.HeaderSHA:
-		// 同一版本，文件指纹和记录不符，且内容不是中文 —— 文件被替换/覆盖过
 		a.Verdict = "stale"
 	case st != nil && st.Version != "" && compareVersion(a.Version, st.Version) > 0:
-		// 比上次汉化的版本更新，且内容不是中文 —— 升级上来的新版本
 		a.Verdict = "upgrade"
 	default:
 		a.Verdict = "never"
@@ -430,38 +474,35 @@ func analyze(d string, st *State) (*Analysis, error) {
 }
 
 func printAnalysis(a *Analysis) {
-	fmt.Printf("目标: %s\n", a.Dir)
-	fmt.Printf("  语言表: %d 条，其中中文 %d 条（%.1f%%）\n", a.Total, a.Chinese, a.Ratio*100)
+	logf("目标: %s\n", a.Dir)
+	logf("  语言表: %d 条，其中中文 %d 条（%.1f%%）\n", a.Total, a.Chinese, a.Ratio*100)
 	switch a.Verdict {
 	case "already":
-		fmt.Println("  判断: 已经是中文")
-		if a.State != nil && a.State.Version == a.Version && a.State.HeaderHash != a.Info.HeaderSHA {
-			fmt.Println("        文件指纹与上次记录不同，但内容仍是中文（可能是别的工具又改过）")
-		}
+		logf("  判断: 已经是中文\n")
 	case "partial":
-		fmt.Println("  判断: 只有部分中文，可能上次汉化被部分覆盖")
+		logf("  判断: 只有部分中文，可能上次汉化被部分覆盖\n")
 	case "stale":
-		fmt.Println("  判断: 汉化已失效 —— 文件被替换过，Claude 可能重新下载了同版本")
+		logf("  判断: 汉化已失效 —— 文件被替换过，Claude 可能重新下载了同版本\n")
 		if a.State != nil {
-			fmt.Printf("        上次汉化: %s（工具 v%s，命中 %d 条）\n",
+			logf("        上次汉化: %s（工具 v%s，命中 %d 条）\n",
 				formatTime(a.State.PatchedAt), a.State.ToolVersion, a.State.Hit)
 		}
 	case "upgrade":
-		fmt.Println("  判断: 这是升级后的新版本，还没汉化")
+		logf("  判断: 这是升级后的新版本，还没汉化\n")
 		if a.State != nil {
-			fmt.Printf("        上次汉化的是 app-%s（%s）\n", a.State.Version, formatTime(a.State.PatchedAt))
+			logf("        上次汉化的是 app-%s（%s）\n", a.State.Version, formatTime(a.State.PatchedAt))
 		}
 	case "never":
-		fmt.Println("  判断: 从未汉化过（原版日文界面）")
+		logf("  判断: 从未汉化过（原版日文界面）\n")
 	}
 }
 
 func printStateInfo(st *State) {
 	if st == nil {
-		fmt.Println("\n没有找到汉化记录文件（说明还没跑过这个工具，或记录被删）")
+		logf("\n没有找到汉化记录文件（还没跑过这个工具，或记录被删）\n")
 		return
 	}
-	fmt.Printf("\n上次汉化记录:\n  时间: %s\n  工具版本: v%s\n  目录: %s\n  命中: %d 条\n",
+	logf("\n上次汉化记录:\n  时间: %s\n  工具版本: v%s\n  目录: %s\n  命中: %d 条\n",
 		formatTime(st.PatchedAt), st.ToolVersion, st.InstallDir, st.Hit)
 }
 
@@ -509,7 +550,7 @@ func doRestore(d string) error {
 		}
 	}
 	os.Remove(statePath())
-	fmt.Printf("[完成] 已还原: %s\n", d)
+	logf("[完成] 已还原: %s\n", d)
 	return nil
 }
 
@@ -522,7 +563,7 @@ func doPatch(a *Analysis, dry, noBackup bool) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("  内置词库: %d 条\n", len(zh))
+	logf("  内置词库: %d 条\n", len(zh))
 
 	var ja map[string]string
 	if err := json.Unmarshal(bytes.TrimRight(info.Content, " \t\r\n\x00"), &ja); err != nil {
@@ -540,7 +581,7 @@ func doPatch(a *Analysis, dry, noBackup bool) error {
 			miss++
 		}
 	}
-	fmt.Printf("  命中中文: %d 条，保留原文: %d 条（%.1f%% 汉化）\n",
+	logf("  命中中文: %d 条，保留原文: %d 条（%.1f%% 汉化）\n",
 		hit, miss, float64(hit)/float64(len(ja))*100)
 
 	var body bytes.Buffer
@@ -561,13 +602,13 @@ func doPatch(a *Analysis, dry, noBackup bool) error {
 	}
 
 	if dry {
-		fmt.Println("  [dry-run] 校验通过，未写入")
+		logf("  [dry-run] 校验通过，未写入\n")
 		return nil
 	}
 
 	if !noBackup {
 		if _, err := os.Stat(ap + ".hanhua-bak"); err != nil {
-			fmt.Println("  备份原文件...")
+			logf("  备份原文件...\n")
 			if err := copyFile(ap, ap+".hanhua-bak"); err != nil {
 				return fmt.Errorf("备份 asar 失败: %w", err)
 			}
@@ -659,7 +700,7 @@ func doPatch(a *Analysis, dry, noBackup bool) error {
 		Hit:         hit,
 	})
 
-	fmt.Println("  [完成] 汉化成功，重新打开 Claude 即可")
-	fmt.Printf("  备份: %s.hanhua-bak\n", ap)
+	logf("  [完成] 汉化成功，重新打开 Claude 即可\n")
+	logf("  备份: %s.hanhua-bak\n", ap)
 	return nil
 }
