@@ -6,9 +6,15 @@
 
 官方 Claude Desktop 的语言包只有 11 种，**没有中文**。你如果在日本区或者账号 locale 被设成 `ja-JP`，整个界面就是日文。
 
-这个工具把内置的 42,627 条中文词库注入到 Claude 的语言资源包（`ion-dist.asar`）里，并同步修正 Electron 的三层完整性校验，让应用正常启动、界面显示中文。
+这个工具把内置的 44,199 条中文词库注入到 Claude 的语言资源包（`ion-dist.asar`）里，并同步修正 Electron 的三层完整性校验，让应用正常启动、界面显示中文。
 
-**当前效果：42,627 条词条，42,624 条为中文（99.99%）**
+工具启动时会先自检，再决定要不要动手：
+
+- **已汉化且文件没变** → 提示「已是中文」，直接跳过
+- **Claude 升级过、资源被换掉** → 提示「检测到新版本」，自动重新汉化
+- **有多个版本目录** → 逐个判断，只处理需要处理的
+
+**当前效果：44,199 条词库，Claude 5.1231.2 实测 100% 汉化（43,714 条全部命中）**
 
 | 原日文 | 汉化后 |
 |---|---|
@@ -26,13 +32,23 @@
 **最简单**：关掉 Claude，双击 `claude-hanhua.exe`，等它跑完，再打开 Claude。
 
 ```
-claude-hanhua.exe              自动检测安装目录并汉化
+claude-hanhua.exe              自动检测：已是中文就跳过，升级过就重打
+claude-hanhua.exe -status      只看状态诊断（是否汉化过、是否升级了）
 claude-hanhua.exe -list        列出检测到的 Claude 安装
 claude-hanhua.exe -dry         只检查不写入（看命中率）
 claude-hanhua.exe -dir <路径>  指定安装目录
 claude-hanhua.exe -restore     还原成原版
+claude-hanhua.exe -force       强制重新汉化（忽略「已是中文」判断）
 claude-hanhua.exe -no-backup   不备份（不建议）
 ```
+
+**升级自检是怎么做的**：每次汉化成功会写一份记录到
+
+```
+%LOCALAPPDATA%\AnthropicClaude\claude-hanhua.state.json
+```
+
+里面存着当时的版本号、资源包头部哈希、命中条数。下次运行就是拿这份记录和磁盘现状对比——哈希对不上说明文件被换过，版本号变大了说明换了新版本。同时也会统计当前语言表里「含汉字且不含日文假名」的条目占比，判断到底有没有中文。两路信息交叉验证，避免误判。
 
 安装目录默认在：
 
@@ -74,7 +90,7 @@ claude-hanhua.exe -restore
 
 ## 注意事项
 
-**Claude 一升级，汉化就失效。** 官方更新会把 `ion-dist.asar` 和 `claude.exe` 整个换掉。升级后重新跑一次这个 exe 即可。如果新版本改了 key，命中率会下降但不会崩——没命中的条目保留原文。
+**Claude 一升级，汉化就失效——但工具能自己发现。** 官方更新会把 `ion-dist.asar` 和 `claude.exe` 整个换掉，并装到一个新的 `app-<版本>` 目录里。下次运行工具时会自动识别「新版本未汉化」并处理，旧版本目录里的汉化不受影响。如果新版本改了 key，命中率会下降但不会崩——没命中的条目保留原文，跑 `-dry` 就能看到命中多少。
 
 **只对 Squirrel 安装版有效。** 也就是 `%LOCALAPPDATA%\AnthropicClaude\app-*` 这种目录结构。Microsoft Store 的 MSIX 版装在 `C:\Program Files\WindowsApps`，受系统保护，工具默认不改它。
 
@@ -85,7 +101,7 @@ claude-hanhua.exe -restore
 ## 词库来源
 
 - 约 6,959 条来自社区项目 [ooac/Claude-desk-cn](https://github.com/ooac/Claude-desk-cn)（macOS 版汉化补丁）
-- 其余约 35,668 条为针对 Windows 版 4.23118.1 的 key 体系批量翻译，严格保留 ICU MessageFormat 占位符（`{count, plural, ...}`）和 HTML 标签结构
+- 其余约 37,240 条为针对 Windows 版 key 体系的批量翻译（含 Claude 5.1231.2 新增的 1,572 条），严格保留 ICU MessageFormat 占位符（`{count, plural, ...}`）和 HTML 标签结构
 
 翻译校验规则（每批都跑）：
 
