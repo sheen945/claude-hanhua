@@ -28,7 +28,7 @@ var zhGz []byte
 const (
 	targetEntry = "i18n/ja-JP.json"
 	toolName    = "Claude 桌面版一键汉化"
-	toolVer     = "1.2.0"
+	toolVer     = "1.3.0"
 )
 
 // logEmit 由界面层接管，用于把日志实时推到窗口里；为空时直接打印到控制台
@@ -77,6 +77,7 @@ type State struct {
 
 type AsarInfo struct {
 	Buf       []byte
+	Path      string
 	HeaderRaw string
 	HeaderEnd int64
 	DataStart int64
@@ -84,6 +85,22 @@ type AsarInfo struct {
 	Abs       int64
 	Content   []byte
 	HeaderSHA string
+}
+
+// asarTarget 描述一个资源包里要汉化的语言表
+type asarTarget struct {
+	Asar    string
+	Entries []string
+}
+
+// patchTargets Claude 6 起界面文案分散在两张 asar、四个语言表里。
+// ion-dist.asar 是主界面，app.asar 管主进程菜单与窗口壳层。
+var patchTargets = []asarTarget{
+	{"ion-dist.asar", []string{"i18n/ja-JP.json", "i18n/dynamic/ja-JP.json"}},
+	{"app.asar", []string{
+		"resources/i18n/ja-JP.json",
+		"resources/frame/shell/i18n/frame-shell/ja-JP.json",
+	}},
 }
 
 type Analysis struct {
@@ -363,14 +380,14 @@ func findEntry(e *Entry, prefix, target string) *Entry {
 	return nil
 }
 
-// openAsar 读取 asar 结构并定位语言表条目
-func openAsar(ap string) (*AsarInfo, error) {
+// openAsarRaw 读取 asar 头部结构，返回原始缓冲区、头部文本和根目录
+func openAsarRaw(ap string) (*AsarInfo, *Entry, error) {
 	buf, err := os.ReadFile(ap)
 	if err != nil {
-		return nil, fmt.Errorf("读取 asar 失败（Claude 可能还在运行，先退出）: %w", err)
+		return nil, nil, fmt.Errorf("读取 asar 失败（Claude 可能还在运行，先退出）: %w", err)
 	}
 	if len(buf) < 16 {
-		return nil, errors.New("asar 文件损坏")
+		return nil, nil, errors.New("asar 文件损坏")
 	}
 	// asar 头部布局: [0:4]=4, [4:8]=headerSize(pickle 总长), [8:12]=headerSize-4,
 	// [12:16]=header JSON 字节长度, 之后是 JSON 本体, 然后是 padding 到 8+headerSize
@@ -379,40 +396,62 @@ func openAsar(ap string) (*AsarInfo, error) {
 	dataStart := 8 + headerSize
 	headerEnd := 16 + jsonLen
 	if headerEnd > int64(len(buf)) {
-		return nil, errors.New("asar 头部长度异常")
+		return nil, nil, errors.New("asar 头部长度异常")
 	}
 	headerRaw := string(buf[16:headerEnd])
+	if dataStart > int64(len(buf)) || dataStart < headerEnd {
+		return nil, nil, errors.New("asar 数据区起点异常")
+	}
 
 	var root Entry
 	if err := json.Unmarshal([]byte(headerRaw), &root); err != nil {
-		return nil, fmt.Errorf("解析 asar 头部失败: %w", err)
-	}
-	ent := findEntry(&root, "", targetEntry)
-	if ent == nil {
-		return nil, fmt.Errorf("asar 里找不到 %s，可能这个版本结构不同", targetEntry)
-	}
-	if ent.Integrity == nil {
-		return nil, errors.New("该条目没有完整性信息，格式不支持")
-	}
-	off, err := strconv.ParseInt(ent.Offset, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("offset 解析失败: %w", err)
-	}
-	abs := dataStart + off
-	if abs+ent.Size > int64(len(buf)) {
-		return nil, errors.New("条目位置越界")
+		return nil, nil, fmt.Errorf("解析 asar 头部失败: %w", err)
 	}
 	sum := sha256.Sum256([]byte(headerRaw))
 	return &AsarInfo{
 		Buf:       buf,
+		Path:      ap,
 		HeaderRaw: headerRaw,
 		HeaderEnd: headerEnd,
 		DataStart: dataStart,
-		Entry:     ent,
-		Abs:       abs,
-		Content:   buf[abs : abs+ent.Size],
 		HeaderSHA: hex.EncodeToString(sum[:]),
-	}, nil
+	}, &root, nil
+}
+
+// locate 在已解析的 asar 里定位条目，并算出数据绝对偏移
+func locate(info *AsarInfo, root *Entry, target string) (*Entry, int64, []byte, error) {
+	ent := findEntry(root, "", target)
+	if ent == nil {
+		return nil, 0, nil, fmt.Errorf("asar 里找不到 %s", target)
+	}
+	if ent.Integrity == nil {
+		return nil, 0, nil, errors.New("该条目没有完整性信息，格式不支持")
+	}
+	off, err := strconv.ParseInt(ent.Offset, 10, 64)
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("offset 解析失败: %w", err)
+	}
+	abs := info.DataStart + off
+	if abs+ent.Size > int64(len(info.Buf)) {
+		return nil, 0, nil, errors.New("条目位置越界")
+	}
+	return ent, abs, info.Buf[abs : abs+ent.Size], nil
+}
+
+// openAsar 打开主语言资源包并定位主语言表
+func openAsar(ap string) (*AsarInfo, error) {
+	info, root, err := openAsarRaw(ap)
+	if err != nil {
+		return nil, err
+	}
+	ent, abs, content, err := locate(info, root, targetEntry)
+	if err != nil {
+		return nil, fmt.Errorf("%v，可能这个版本结构不同", err)
+	}
+	info.Entry = ent
+	info.Abs = abs
+	info.Content = content
+	return info, nil
 }
 
 // countChinese 统计真正的「中文条目」：含汉字且不含日文假名。
@@ -529,161 +568,302 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-func doRestore(d string) error {
-	bak := asarPath(d) + ".hanhua-bak"
-	if _, err := os.Stat(bak); err != nil {
-		return errors.New("没有找到备份，无法还原")
-	}
-	exeBak := exePath(d) + ".hanhua-bak"
-	if err := os.Rename(bak, asarPath(d)); err != nil {
-		if err := copyFile(bak, asarPath(d)); err != nil {
-			return err
-		}
-		os.Remove(bak)
-	}
-	if _, err := os.Stat(exeBak); err == nil {
-		if err := os.Rename(exeBak, exePath(d)); err != nil {
-			if err := copyFile(exeBak, exePath(d)); err != nil {
-				return err
-			}
-			os.Remove(exeBak)
-		}
-	}
-	os.Remove(statePath())
-	logf("[完成] 已还原: %s\n", d)
-	return nil
-}
-
-func doPatch(a *Analysis, dry, noBackup bool) error {
-	d := a.Dir
-	ap, ep := asarPath(d), exePath(d)
-	info := a.Info
-
-	zh, err := loadCatalog()
-	if err != nil {
-		return err
-	}
-	logf("  内置词库: %d 条\n", len(zh))
-
+// buildMerged 把词库合并进目标语言表，输出填充到原槽位的字节。
+// 槽位长度固定，短出来的部分用空格补齐，避免改动 asar 布局。
+func buildMerged(raw []byte, zh map[string]string) (filled []byte, total, hit int, err error) {
 	var ja map[string]string
-	if err := json.Unmarshal(bytes.TrimRight(info.Content, " \t\r\n\x00"), &ja); err != nil {
-		return fmt.Errorf("解析目标语言表失败: %w", err)
+	if err := json.Unmarshal(bytes.TrimRight(raw, " \t\r\n\x00"), &ja); err != nil {
+		return nil, 0, 0, fmt.Errorf("解析目标语言表失败: %w", err)
 	}
-
 	merged := make(map[string]string, len(ja))
-	var hit, miss int
 	for k, v := range ja {
 		if nv, ok := zh[k]; ok && strings.TrimSpace(nv) != "" {
 			merged[k] = nv
 			hit++
 		} else {
 			merged[k] = v
-			miss++
 		}
 	}
-	logf("  命中中文: %d 条，保留原文: %d 条（%.1f%% 汉化）\n",
-		hit, miss, float64(hit)/float64(len(ja))*100)
-
 	var body bytes.Buffer
 	enc := json.NewEncoder(&body)
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", " ")
 	if err := enc.Encode(merged); err != nil {
-		return fmt.Errorf("生成新语言表失败: %w", err)
+		return nil, 0, 0, fmt.Errorf("生成新语言表失败: %w", err)
 	}
-	outBytes := bytes.TrimRight(body.Bytes(), "\n")
-	if int64(len(outBytes)) > info.Entry.Size {
-		return fmt.Errorf("新语言表 %d 字节，超出槽位 %d 字节", len(outBytes), info.Entry.Size)
+	out := bytes.TrimRight(body.Bytes(), "\n")
+	slot := len(raw)
+	if len(out) > slot {
+		return nil, 0, 0, fmt.Errorf("新语言表 %d 字节，超出槽位 %d 字节", len(out), slot)
 	}
-	filled := make([]byte, info.Entry.Size)
-	copy(filled, outBytes)
-	for i := len(outBytes); i < len(filled); i++ {
+	filled = make([]byte, slot)
+	copy(filled, out)
+	for i := len(out); i < slot; i++ {
 		filled[i] = 0x20
 	}
+	return filled, len(ja), hit, nil
+}
 
+// patchAsar 汉化一个资源包里的全部目标语言表，返回旧/新头部哈希与主表命中数
+func patchAsar(dir string, t asarTarget, zh map[string]string, dry, noBackup bool) (oldCands []string, newHash string, hit, total int, err error) {
+	ap := filepath.Join(dir, "resources", t.Asar)
+	info, root, err := openAsarRaw(ap)
+	if err != nil {
+		return nil, "", 0, 0, err
+	}
+
+	type edit struct {
+		ent  *Entry
+		abs  int64
+		data []byte
+	}
+	var edits []edit
+	for _, e := range t.Entries {
+		ent, abs, raw, lerr := locate(info, root, e)
+		if lerr != nil {
+			logf("  [跳过] %s: %v\n", e, lerr)
+			continue
+		}
+		filled, n, h, berr := buildMerged(raw, zh)
+		if berr != nil {
+			return nil, "", 0, 0, fmt.Errorf("%s: %v", e, berr)
+		}
+		logf("  %-52s %6d 条，命中 %6d（%.1f%%）\n", e, n, h, 100*float64(h)/float64(n+1))
+		if e == targetEntry || (t.Asar == "ion-dist.asar" && e == "i18n/ja-JP.json") {
+			hit, total = h, n
+		}
+		edits = append(edits, edit{ent, abs, filled})
+	}
+	if len(edits) == 0 {
+		return nil, "", 0, 0, errors.New("没有可处理的条目")
+	}
 	if dry {
-		logf("  [dry-run] 校验通过，未写入\n")
-		return nil
+		logf("  [dry-run] %s 校验通过，未写入\n", t.Asar)
+		return nil, "", hit, total, nil
 	}
 
 	if !noBackup {
-		if _, err := os.Stat(ap + ".hanhua-bak"); err != nil {
-			logf("  备份原文件...\n")
-			if err := copyFile(ap, ap+".hanhua-bak"); err != nil {
-				return fmt.Errorf("备份 asar 失败: %w", err)
-			}
-			if err := copyFile(ep, ep+".hanhua-bak"); err != nil {
-				return fmt.Errorf("备份 exe 失败: %w", err)
+		if _, serr := os.Stat(ap + ".hanhua-bak"); serr != nil {
+			logf("  备份 %s ...\n", t.Asar)
+			if cerr := copyFile(ap, ap+".hanhua-bak"); cerr != nil {
+				return nil, "", 0, 0, fmt.Errorf("备份 %s 失败: %w", t.Asar, cerr)
 			}
 		}
 	}
 
 	buf := info.Buf
-	oldHash := info.Entry.Integrity.Hash
-	oldBlocks := append([]string{}, info.Entry.Integrity.Blocks...)
-	oldHeaderHash := info.HeaderSHA
+	newHeader := info.HeaderRaw
+	for _, ed := range edits {
+		copy(buf[ed.abs:ed.abs+ed.ent.Size], ed.data)
 
-	copy(buf[info.Abs:info.Abs+info.Entry.Size], filled)
-	if err := os.WriteFile(ap, buf, 0644); err != nil {
-		return fmt.Errorf("写入 asar 失败: %w", err)
+		old := ed.ent.Integrity.Hash
+		sum := sha256.Sum256(ed.data)
+		fresh := hex.EncodeToString(sum[:])
+
+		// 先处理分块哈希：小于一个分块的条目，它的 blocks[0] 和整文件哈希是同一个值，
+		// 两条命中的字符串必须一起换掉，所以用 ReplaceAll 而不是限定一次。
+		bs := ed.ent.Integrity.BlockSize
+		if bs <= 0 {
+			bs = 4194304
+		}
+		var newBlocks []string
+		for i := int64(0); i < int64(len(ed.data)); i += bs {
+			end := i + bs
+			if end > int64(len(ed.data)) {
+				end = int64(len(ed.data))
+			}
+			s := sha256.Sum256(ed.data[i:end])
+			newBlocks = append(newBlocks, hex.EncodeToString(s[:]))
+		}
+		for i, ob := range ed.ent.Integrity.Blocks {
+			if i >= len(newBlocks) {
+				break
+			}
+			newHeader = strings.ReplaceAll(newHeader, ob, newBlocks[i])
+		}
+
+		if strings.Count(newHeader, old) > 0 {
+			newHeader = strings.ReplaceAll(newHeader, old, fresh)
+		} else if !strings.Contains(newHeader, fresh) {
+			// 分块替换没顺带覆盖整文件哈希，说明结构异常
+			return nil, "", 0, 0, fmt.Errorf("%s 条目哈希在头部找不到，放弃", t.Asar)
+		}
 	}
 
-	newSum := sha256.Sum256(filled)
-	newHash := hex.EncodeToString(newSum[:])
-	var newBlocks []string
-	bs := info.Entry.Integrity.BlockSize
-	if bs <= 0 {
-		bs = 4194304
-	}
-	for i := int64(0); i < int64(len(filled)); i += bs {
-		end := i + bs
-		if end > int64(len(filled)) {
-			end = int64(len(filled))
-		}
-		s := sha256.Sum256(filled[i:end])
-		newBlocks = append(newBlocks, hex.EncodeToString(s[:]))
-	}
-
-	if strings.Count(info.HeaderRaw, oldHash) != 1 {
-		return errors.New("条目哈希在头部不唯一，放弃（请反馈这个情况）")
-	}
-	newHeader := strings.Replace(info.HeaderRaw, oldHash, newHash, 1)
-	for i := range oldBlocks {
-		if i >= len(newBlocks) {
-			break
-		}
-		if strings.Count(newHeader, oldBlocks[i]) != 1 {
-			return errors.New("分块哈希在头部不唯一，放弃")
-		}
-		newHeader = strings.Replace(newHeader, oldBlocks[i], newBlocks[i], 1)
-	}
 	if len(newHeader) != len(info.HeaderRaw) {
-		return errors.New("头部长度变化，放弃")
+		return nil, "", 0, 0, errors.New("头部长度变化，放弃")
 	}
 	copy(buf[16:info.HeaderEnd], []byte(newHeader))
-	if err := os.WriteFile(ap, buf, 0644); err != nil {
-		return fmt.Errorf("写入头部失败: %w", err)
+	if werr := os.WriteFile(ap, buf, 0644); werr != nil {
+		return nil, "", 0, 0, fmt.Errorf("写入 %s 失败: %w", t.Asar, werr)
 	}
+	fs := sha256.Sum256([]byte(newHeader))
+	nh := hex.EncodeToString(fs[:])
+	logf("  头部哈希 %s -> %s\n", info.HeaderSHA[:12], nh[:12])
 
+	// exe 里记录的旧头部哈希可能是任意历史值：原版、上一次汉化的结果，或者
+	// 上次写 exe 失败时留下的中间态。所以把「当前值 + 备份原版值」都当候选，
+	// 由 patchExe 在 exe 里逐个试，命中哪个就换哪个。
+	cands := []string{info.HeaderSHA}
+	if o, herr := asarHeaderHash(ap + ".hanhua-bak"); herr == nil {
+		cands = append(cands, o)
+	}
+	return cands, nh, hit, total, nil
+}
+
+// asarHeaderHash 只读 asar 头部并算哈希，用于取原版备份的头部哈希
+func asarHeaderHash(p string) (string, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	head := make([]byte, 16)
+	if _, err := io.ReadFull(f, head); err != nil {
+		return "", err
+	}
+	jsonLen := int64(binary.LittleEndian.Uint32(head[12:16]))
+	if jsonLen <= 0 || jsonLen > 64<<20 {
+		return "", errors.New("头部长度异常")
+	}
+	body := make([]byte, jsonLen)
+	if _, err := io.ReadFull(f, body); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// hashRep 一次 exe 哈希替换：Olds 是候选旧值，命中哪个就用哪个。
+type hashRep struct {
+	Olds []string
+	New  string
+}
+
+// patchExe 把 exe 里记录的 asar 头部哈希换成新值。所有替换一次性读写。
+func patchExe(ep string, reps []hashRep, noBackup bool) error {
+	if len(reps) == 0 {
+		return nil
+	}
+	if !noBackup {
+		if _, err := os.Stat(ep + ".hanhua-bak"); err != nil {
+			logf("  备份 claude.exe ...\n")
+			if err := copyFile(ep, ep+".hanhua-bak"); err != nil {
+				return fmt.Errorf("备份 exe 失败: %w", err)
+			}
+		}
+	}
 	exeBuf, err := os.ReadFile(ep)
 	if err != nil {
 		return fmt.Errorf("读取 exe 失败: %w", err)
 	}
-	pos := bytes.Index(exeBuf, []byte(oldHeaderHash))
-	if pos < 0 {
-		return errors.New("exe 里找不到 asar 头部哈希（版本结构不同，请反馈）")
+	for _, r := range reps {
+		if len(r.New) != 64 {
+			return errors.New("哈希长度异常")
+		}
+		applied := false
+		for _, oldH := range r.Olds {
+			if len(oldH) != 64 {
+				continue
+			}
+			if bytes.Count(exeBuf, []byte(oldH)) != 1 {
+				continue
+			}
+			idx := bytes.Index(exeBuf, []byte(oldH))
+			copy(exeBuf[idx:idx+64], []byte(r.New))
+			applied = true
+			break
+		}
+		if !applied {
+			if bytes.Contains(exeBuf, []byte(r.New)) {
+				logf("  exe 里已经是新哈希 %s，跳过\n", r.New[:12])
+				continue
+			}
+			return fmt.Errorf("exe 里找不到对应的旧头部哈希（版本结构不同）")
+		}
 	}
-	if bytes.Count(exeBuf, []byte(oldHeaderHash)) != 1 {
-		return errors.New("exe 里哈希不唯一，放弃")
-	}
-	finalSum := sha256.Sum256([]byte(newHeader))
-	finalHash := hex.EncodeToString(finalSum[:])
-	copy(exeBuf[pos:pos+64], []byte(finalHash))
 	if err := os.WriteFile(ep, exeBuf, 0644); err != nil {
 		return fmt.Errorf("写入 exe 失败: %w", err)
 	}
+	logf("  exe 内 %d 处头部哈希已同步\n", len(reps))
+	return nil
+}
 
-	st, _ := os.Stat(ap)
+func doRestore(d string) error {
+	n := 0
+	for _, t := range patchTargets {
+		ap := filepath.Join(d, "resources", t.Asar)
+		bak := ap + ".hanhua-bak"
+		if _, err := os.Stat(bak); err != nil {
+			continue
+		}
+		if err := os.Rename(bak, ap); err != nil {
+			if err := copyFile(bak, ap); err != nil {
+				return err
+			}
+			os.Remove(bak)
+		}
+		n++
+	}
+	ep := exePath(d)
+	if _, err := os.Stat(ep + ".hanhua-bak"); err == nil {
+		if err := os.Rename(ep+".hanhua-bak", ep); err != nil {
+			if err := copyFile(ep+".hanhua-bak", ep); err != nil {
+				return err
+			}
+			os.Remove(ep + ".hanhua-bak")
+		}
+		n++
+	}
+	if n == 0 {
+		return errors.New("没有找到备份，无法还原")
+	}
+	os.Remove(statePath())
+	logf("[完成] 已还原 %d 个文件: %s\n", n, d)
+	return nil
+}
+
+func doPatch(a *Analysis, dry, noBackup bool) error {
+	d := a.Dir
+	zh, err := loadCatalog()
+	if err != nil {
+		return err
+	}
+	logf("  内置词库: %d 条\n", len(zh))
+
+	var reps []hashRep
+	var mainNewHash string
+	mainHit, mainTotal := 0, 0
+	st0 := loadState()
+	for _, t := range patchTargets {
+		cands, nh, h, n, perr := patchAsar(d, t, zh, dry, noBackup)
+		if perr != nil {
+			logf("  [失败] %s: %v\n", t.Asar, perr)
+			continue
+		}
+		if t.Asar == "ion-dist.asar" {
+			mainNewHash = nh
+			mainHit, mainTotal = h, n
+		}
+		if !dry && nh != "" {
+			// 上次打补丁写进 exe 的哈希也算候选，重复运行才对得上
+			if st0 != nil && st0.HeaderHash != "" {
+				cands = append(cands, st0.HeaderHash)
+			}
+			reps = append(reps, hashRep{Olds: cands, New: nh})
+		}
+	}
+	if dry {
+		return nil
+	}
+	if len(reps) == 0 {
+		return errors.New("没有任何资源包被成功处理")
+	}
+	if err := patchExe(exePath(d), reps, noBackup); err != nil {
+		return err
+	}
+
+	st, _ := os.Stat(asarPath(d))
 	var mtime int64
 	if st != nil {
 		mtime = st.ModTime().Unix()
@@ -693,14 +873,14 @@ func doPatch(a *Analysis, dry, noBackup bool) error {
 		PatchedAt:   time.Now().Format(time.RFC3339),
 		InstallDir:  d,
 		Version:     versionOf(d),
-		HeaderHash:  finalHash,
-		AsarSize:    int64(len(buf)),
+		HeaderHash:  mainNewHash,
+		AsarSize:    int64(len(a.Info.Buf)),
 		AsarMTime:   mtime,
-		Entries:     len(ja),
-		Hit:         hit,
+		Entries:     mainTotal,
+		Hit:         mainHit,
 	})
 
 	logf("  [完成] 汉化成功，重新打开 Claude 即可\n")
-	logf("  备份: %s.hanhua-bak\n", ap)
+	logf("  备份: resources\\*.hanhua-bak 与 claude.exe.hanhua-bak\n")
 	return nil
 }

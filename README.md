@@ -6,7 +6,7 @@
 
 官方 Claude Desktop 的语言包只有 11 种，**没有中文**。你如果在日本区或者账号 locale 被设成 `ja-JP`，整个界面就是日文。
 
-这个工具把内置的 44,199 条中文词库注入到 Claude 的语言资源包（`ion-dist.asar`）里，并同步修正 Electron 的三层完整性校验，让应用正常启动、界面显示中文。
+这个工具把内置的 **50,140 条**中文词库注入到 Claude 的语言资源包里，并同步修正 Electron 的完整性校验，让应用正常启动、界面显示中文。
 
 工具启动时会先自检，再决定要不要动手：
 
@@ -14,7 +14,14 @@
 - **Claude 升级过、资源被换掉** → 提示「检测到新版本」，自动重新汉化
 - **有多个版本目录** → 逐个判断，只处理需要处理的
 
-**当前效果：44,199 条词库，Claude 5.1231.2 实测 100% 汉化（43,714 条全部命中）**
+**当前效果：50,140 条词库，Claude 6.28899.6 实测四张语言表全部覆盖，零日文残留**
+
+| 语言表 | 位置 | 条数 | 覆盖 |
+|---|---|---|---|
+| 主界面文案 | `ion-dist.asar` → `i18n/ja-JP.json` | 46,448 | 100% |
+| 动态文案 | `ion-dist.asar` → `i18n/dynamic/ja-JP.json` | 51 | 100% |
+| 主进程 / 菜单 | `app.asar` → `resources/i18n/ja-JP.json` | 1,575 | 100% |
+| 窗口壳层 | `app.asar` → `resources/frame/shell/i18n/frame-shell/ja-JP.json` | 1,901 | 100% |
 
 | 原日文 | 汉化后 |
 |---|---|
@@ -26,6 +33,8 @@
 | ファイルやコネクタなどを追加 | 添加文件、连接器等 |
 | タスクを開始 | 开始任务 |
 | プロバイダーに認証情報が拒否されました | 提供方拒绝了凭据。请在「设置」中重新输入。 |
+
+剩下的非中文条目都是英文产品名、快捷键和纯占位符（`Cowork`、`Haiku`、`{name} · {state}`），刻意不译。
 
 ## 用法
 
@@ -73,25 +82,32 @@ claude-hanhua.exe -no-backup   不备份（不建议）
 Claude 的资源包是 Electron 的 `asar` 格式，改里面的文件会踩到三层校验，少改一层应用直接闪退：
 
 1. **条目级 SHA256**：asar 头部 JSON 里每个文件有自己的 `integrity.hash`
-2. **分块哈希**：大于 4MB 的条目还有 `blocks` 数组，每 4MB 一个 SHA256
+2. **分块哈希**：每个条目还有 `blocks` 数组，按 `blockSize` 切块算 SHA256
 3. **头部哈希**：整个头部 JSON 的 SHA256 被嵌在 `claude.exe` 的 PE 资源里
 
-工具的处理顺序：
+Claude 6 起界面文案分散在两张 asar、四个语言表里，所以要处理两次：
 
-1. 读 `resources\ion-dist.asar`，定位 `i18n/ja-JP.json` 条目（4.48MB）
-2. 用内置中文词库按 key 合并：命中用中文，没命中保留原文
-3. 写回原槽位，不足部分空格填充（保持长度不变）
-4. 重算条目 SHA256 + 每个 4MB 分块的 SHA256，替换头部 JSON 里的旧值
-5. 重算头部 SHA256，替换 `claude.exe` 里记录的旧值
-6. 备份原文件为 `*.hanhua-bak`，出问题可以 `-restore`
+1. 读 `resources\ion-dist.asar`，定位 `i18n/ja-JP.json`（4.97MB）和 `i18n/dynamic/ja-JP.json`
+2. 读 `resources\app.asar`，定位 `resources/i18n/ja-JP.json` 和窗口壳层那份
+3. 用内置中文词库按 key 合并：命中用中文，没命中保留原文
+4. 写回原槽位，不足部分空格填充（保持长度不变）
+5. 重算条目 SHA256 + 每个分块的 SHA256，替换头部 JSON 里的旧值
+6. 重算头部 SHA256，替换 `claude.exe` 里记录的旧值
+7. 备份原文件为 `*.hanhua-bak`，出问题可以 `-restore`
+
+两个细节踩过坑，写在这里省得别人再踩：
+
+- **小条目的整文件哈希和第一个分块哈希是同一个字符串**（一个分块就装完了）。先替换分块再替换整文件，且必须用「全部替换」而不是「替换一次」，否则尾部会剩一半旧值。
+- **重复运行要能对上 exe 里的旧哈希**。exe 里可能是原版哈希、上一次汉化的哈希，或者上次写 exe 失败留下的中间态。工具把「当前值 + 备份原版值 + 上次记录值」都当候选，逐个在 exe 里试，命中哪个换哪个。
 
 ## 备份与还原
 
 首次汉化会自动备份：
 
 ```
-resources\ion-dist.asar.hanhua-bak   原版资源包（203 MB）
-claude.exe.hanhua-bak                原版 exe（247 MB）
+resources\ion-dist.asar.hanhua-bak   原版资源包
+resources\app.asar.hanhua-bak        原版资源包
+claude.exe.hanhua-bak                原版 exe
 ```
 
 还原：
@@ -102,7 +118,9 @@ claude-hanhua.exe -restore
 
 ## 注意事项
 
-**Claude 一升级，汉化就失效——但工具能自己发现。** 官方更新会把 `ion-dist.asar` 和 `claude.exe` 整个换掉，并装到一个新的 `app-<版本>` 目录里。下次运行工具时会自动识别「新版本未汉化」并处理，旧版本目录里的汉化不受影响。如果新版本改了 key，命中率会下降但不会崩——没命中的条目保留原文，跑 `-dry` 就能看到命中多少。
+**Claude 一升级，汉化就失效——但工具能自己发现。** 官方更新会把资源包和 `claude.exe` 整个换掉，并装到一个新的 `app-<版本>` 目录里。下次运行工具时会自动识别「新版本未汉化」并处理，旧版本目录里的汉化不受影响。如果新版本改了 key，命中率会下降但不会崩——没命中的条目保留原文，跑 `-dry` 就能看到命中多少。
+
+**汉化前先退出 Claude。** 资源包和 exe 被占用时写不进去，工具会提示失败；退出应用再点一次即可。
 
 **只对 Squirrel 安装版有效。** 也就是 `%LOCALAPPDATA%\AnthropicClaude\app-*` 这种目录结构。Microsoft Store 的 MSIX 版装在 `C:\Program Files\WindowsApps`，受系统保护，工具默认不改它。
 
@@ -113,15 +131,16 @@ claude-hanhua.exe -restore
 ## 词库来源
 
 - 约 6,959 条来自社区项目 [ooac/Claude-desk-cn](https://github.com/ooac/Claude-desk-cn)（macOS 版汉化补丁）
-- 其余约 37,240 条为针对 Windows 版 key 体系的批量翻译（含 Claude 5.1231.2 新增的 1,572 条），严格保留 ICU MessageFormat 占位符（`{count, plural, ...}`）和 HTML 标签结构
+- 其余为针对 Windows 版 key 体系的批量翻译：v1.0–v1.2 覆盖 Claude 5.1231.2，v1.3.0 补齐 Claude 6.28899.6 新增的 5,941 条（含主进程菜单与壳层两份表）
 
 翻译校验规则（每批都跑）：
 
 - 键集合与原文完全一致
 - 每个值里的 `{变量名}` 集合与原文一致
-- ICU 的 plural / select / number 结构不动
+- ICU 的 plural / select / number 结构不动（`{count, plural, one {…} other {…}}` 里的自然语言照译，语法关键字不译）
 - HTML 标签（`<b>`、`<link>`、`<code>`）不丢
-- 产品名保持英文（Claude、Anthropic、Artifacts、Cowork、Slack、AWS、MCP…）
+- 译文里不许有日文假名残留
+- 产品名保持英文（Claude、Anthropic、Artifacts→作品、Cowork、Slack、AWS、MCP…）
 
 ## 自己编译
 
